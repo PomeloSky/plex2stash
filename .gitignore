@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.next/
+.turbo/
+*.tsbuildinfo
+.env
+.env.local
+data/
+!data/.gitkeep
+
+# Synology NAS thumbnail/index directories
+@eaDir/
+**/@eaDir/
+
+# macOS
+.DS_Store

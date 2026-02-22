@@ -1,0 +1,19 @@
+{
+  "name": "plex2stash",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "dev:api": "pnpm --filter @plex2stash/api dev",
+    "dev:web": "pnpm --filter @plex2stash/web dev",
+    "build:api": "pnpm --filter @plex2stash/api build",
+    "build:web": "pnpm --filter @plex2stash/web build"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0",
+    "typescript": "^5.7.0"
+  }
+}
