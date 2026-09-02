@@ -31,8 +31,8 @@ class CacheService {
 
   // ---- match cache ----
 
-  matchKey(stashId: string, title: string, year?: number): string {
-    return `match:${stashId}:${title.toLowerCase().trim()}:${year ?? ''}`;
+  matchKey(stashId: string, title: string, year?: number, manual?: boolean): string {
+    return `match:${stashId}:${title.toLowerCase().trim()}:${year ?? ''}:${manual ? 1 : 0}`;
   }
 
   getMatch(key: string): any | undefined {

@@ -21,10 +21,6 @@ import { loggerService } from './logger.service.js';
 // ID helpers
 // ============================================================
 
-/**
- * Sanitize a stashId for Plex identifiers.
- * Only [a-zA-Z0-9.] allowed.
- */
 function sanitizeIdentifier(stashId: string): string {
   return stashId
     .replace(/[^a-zA-Z0-9.]/g, '.')
@@ -32,42 +28,28 @@ function sanitizeIdentifier(stashId: string): string {
     .replace(/^\.+|\.+$/g, '');
 }
 
-/**
- * Compute the full provider identifier for a stashId.
- * Used as the `identifier` field AND as the URI scheme in all GUIDs.
- */
 function buildIdentifier(stashId: string): string {
   return `${PROVIDER_ID_PREFIX}.${sanitizeIdentifier(stashId)}`;
 }
 
-/**
- * Build a Plex-compatible GUID.
- * Format: {identifier}://{kind}.{sceneId}
- * The scheme matches the provider identifier exactly — required by Plex.
- */
-function buildGuid(identifier: string, kind: ItemKind, sceneId: string): string {
-  return `${identifier}://${kind}.${sceneId}`;
-}
-
-/**
- * Build a ratingKey for an item.
- * Scoped to the stash (stashId is already in the URL path).
- * Format: {kind}.{sceneId}
- */
+// Plex restricts ratingKey to ASCII letters, numbers, dashes and
+// underscores (regex [a-zA-Z0-9_-]) — periods are not allowed.
 function buildRatingKey(kind: ItemKind, sceneId: string): string {
-  return `${kind}.${sceneId}`;
+  return `${kind}-${sceneId}`;
 }
 
-/**
- * Parse an incoming id parameter into its kind and underlying sceneId.
- * Supports prefixed format: movie.123, show.123, season.123, episode.123.
- * Falls back to 'movie' for backward compatibility.
- */
+// Per Plex's GUID construction spec: {scheme}://{metadataType}/{ratingKey}
+// — the path after the scheme uses a slash, and the final component must
+// match the item's ratingKey exactly.
+function buildGuid(identifier: string, kind: ItemKind, sceneId: string): string {
+  return `${identifier}://${kind}/${buildRatingKey(kind, sceneId)}`;
+}
+
 function parseItemId(id: string): { kind: ItemKind; sceneId: string } {
-  if (id.startsWith('movie.'))   return { kind: 'movie',   sceneId: id.slice(6) };
-  if (id.startsWith('show.'))    return { kind: 'show',    sceneId: id.slice(5) };
-  if (id.startsWith('season.'))  return { kind: 'season',  sceneId: id.slice(7) };
-  if (id.startsWith('episode.')) return { kind: 'episode', sceneId: id.slice(8) };
+  if (id.startsWith('movie-'))   return { kind: 'movie',   sceneId: id.slice(6) };
+  if (id.startsWith('show-'))    return { kind: 'show',    sceneId: id.slice(5) };
+  if (id.startsWith('season-'))  return { kind: 'season',  sceneId: id.slice(7) };
+  if (id.startsWith('episode-')) return { kind: 'episode', sceneId: id.slice(8) };
   return { kind: 'movie', sceneId: id };
 }
 
@@ -75,14 +57,12 @@ function parseItemId(id: string): { kind: ItemKind; sceneId: string } {
 // Utility helpers
 // ============================================================
 
-/** Extract year from ISO date string "2024-01-15" → 2024 */
 function yearFromDate(date?: string): number {
   if (!date) return 0;
   const y = parseInt(date.slice(0, 4), 10);
   return isNaN(y) ? 0 : y;
 }
 
-/** Token-overlap title-similarity score (0–100) */
 function titleScore(query: string, target: string): number {
   const q = query.toLowerCase().trim();
   const t = target.toLowerCase().trim();
@@ -96,13 +76,11 @@ function titleScore(query: string, target: string): number {
   return Math.round((overlap / maxLen) * 70);
 }
 
-/** Build an image proxy URL so Plex fetches images without Stash auth. */
 function proxyImageUrl(stashId: string, rawUrl?: string): string | undefined {
   if (!rawUrl) return undefined;
   return `/providers/${stashId}/imageProxy?url=${encodeURIComponent(rawUrl)}`;
 }
 
-/** Resolve fieldSync, falling back to all-enabled defaults. */
 function resolveFieldSync(fs?: Partial<FieldSync> | null): FieldSync {
   return { ...DEFAULT_FIELD_SYNC, ...(fs ?? {}) };
 }
@@ -118,15 +96,19 @@ function sceneToMatchResult(
   scene: StashScene,
   queryTitle: string,
   kind: ItemKind,
-  queryYear?: number,
+  queryYear: number | undefined,
 ): MatchResult {
   const sceneYear = yearFromDate(scene.date);
   let score = titleScore(queryTitle, scene.title);
   if (queryYear && sceneYear === queryYear) score = Math.min(score + 15, 100);
 
+  const ratingKey = buildRatingKey(kind, scene.id);
+
   return {
     guid: buildGuid(identifier, kind, scene.id),
-    name: scene.title,
+    ratingKey,
+    key: `/library/metadata/${ratingKey}`,
+    title: scene.title,
     year: sceneYear || new Date().getFullYear(),
     score,
     type: kind === 'show' ? 'show' : 'movie',
@@ -134,9 +116,33 @@ function sceneToMatchResult(
 }
 
 /**
- * Map a Stash scene to a Plex Movie (type 1) MetadataItem.
- * fieldSync controls which optional fields are included.
+ * Merge full rich metadata fields into an already-built match candidate.
+ * Applied to any candidate whose score clears the positive-match threshold
+ * (85) — Plex does not reliably follow up a match with a separate GET
+ * /library/metadata/{id} call, so the match response is often the only
+ * chance to deliver summary/date/genre/images.
  */
+function enrichMatchResultWithFullMetadata(
+  result: MatchResult,
+  stashId: string,
+  scene: StashScene,
+  fs: FieldSync,
+): void {
+  result.summary = fs.summary ? (scene.details || '') : '';
+  result.originallyAvailableAt = fs.date ? (scene.date || undefined) : undefined;
+  result.thumb = fs.poster ? proxyImageUrl(stashId, scene.paths?.screenshot) : undefined;
+  result.art = fs.background ? proxyImageUrl(stashId, scene.paths?.preview) : undefined;
+
+  if (fs.studio && scene.studio) result.studio = scene.studio.name;
+  if (fs.tags && scene.tags?.length) result.Genre = scene.tags.map((t) => ({ tag: t.name }));
+  if (fs.performers && scene.performers?.length) {
+    result.Role = scene.performers.map((p) => ({
+      tag: p.name,
+      thumb: fs.poster ? proxyImageUrl(stashId, p.image_path) : undefined,
+    }));
+  }
+}
+
 function sceneToMovieMetadata(
   identifier: string,
   stashId: string,
@@ -173,10 +179,6 @@ function sceneToMovieMetadata(
   return item;
 }
 
-/**
- * Map a Stash scene to a Plex Show (type 2) MetadataItem.
- * Each scene is wrapped as a "show" with 1 virtual season / 1 episode.
- */
 function sceneToShowMetadata(
   identifier: string,
   stashId: string,
@@ -209,10 +211,6 @@ function sceneToShowMetadata(
   return item;
 }
 
-/**
- * Build a virtual Plex Season (type 3) for a scene.
- * One season per show; all episodes belong to Season 1.
- */
 function sceneToSeasonMetadata(
   identifier: string,
   stashId: string,
@@ -234,6 +232,9 @@ function sceneToSeasonMetadata(
     index: 1,
     leafCount: 1,
     parentRatingKey: showRk,
+    parentKey: `/library/metadata/${showRk}`,
+    parentGuid: buildGuid(identifier, 'show', scene.id),
+    parentType: 'show',
     parentTitle: scene.title,
     parentThumb: fs.poster ? proxyImageUrl(stashId, scene.paths?.screenshot) : undefined,
     thumb: fs.poster ? proxyImageUrl(stashId, scene.paths?.screenshot) : undefined,
@@ -241,10 +242,6 @@ function sceneToSeasonMetadata(
   };
 }
 
-/**
- * Map a Stash scene to a Plex Episode (type 4) MetadataItem.
- * Positioned as Season 1, Episode 1 under its parent show.
- */
 function sceneToEpisodeMetadata(
   identifier: string,
   stashId: string,
@@ -270,8 +267,14 @@ function sceneToEpisodeMetadata(
     index: 1,
     parentIndex: 1,
     parentRatingKey: seasonRk,
+    parentKey: `/library/metadata/${seasonRk}`,
+    parentGuid: buildGuid(identifier, 'season', scene.id),
+    parentType: 'season',
     parentTitle: 'Season 1',
     grandparentRatingKey: showRk,
+    grandparentKey: `/library/metadata/${showRk}`,
+    grandparentGuid: buildGuid(identifier, 'show', scene.id),
+    grandparentType: 'show',
     grandparentTitle: scene.title,
     thumb: fs.poster ? proxyImageUrl(stashId, scene.paths?.screenshot) : undefined,
     art:   fs.background ? proxyImageUrl(stashId, scene.paths?.preview) : undefined,
@@ -293,16 +296,6 @@ function sceneToEpisodeMetadata(
 // ============================================================
 
 class ProviderService {
-  /**
-   * Provider root — Plex discovery endpoint.
-   *
-   * CRITICAL FORMAT RULES:
-   *  • MediaProvider is a single OBJECT, not array
-   *  • No MediaContainer wrapper
-   *  • `Type` uses { id, Scheme } objects — `id` NOT `type` (causes parse error)
-   *  • `Scheme[].scheme` MUST equal `identifier` exactly
-   *  • `protocols: 'metadata'` required
-   */
   async getProviderRoot(stashId: string): Promise<ProviderRootResponse> {
     const stash = await configService.getStash(stashId);
     const name = stash?.name || `Stash ${stashId}`;
@@ -316,9 +309,11 @@ class ProviderService {
         title: name,
         version: PROVIDER_VERSION,
         protocols: 'metadata',
-        Type: [
-          { id: 1, Scheme: [{ scheme: identifier }] },
-          { id: 2, Scheme: [{ scheme: identifier }] },
+        Types: [
+          { type: 1, Scheme: [{ scheme: identifier }] },
+          { type: 2, Scheme: [{ scheme: identifier }] },
+          { type: 3, Scheme: [{ scheme: identifier }] },
+          { type: 4, Scheme: [{ scheme: identifier }] },
         ],
         Feature: [
           { type: 'match',    key: `/library/metadata/matches` },
@@ -329,34 +324,50 @@ class ProviderService {
     };
   }
 
-  /**
-   * Match — search a single stash, return candidates.
-   * Respects request.type: 1 → movie, 2 → show, undefined → movie.
-   */
   async matchMetadata(stashId: string, request: MatchRequest): Promise<MatchResponse> {
     const kind: ItemKind = request.type === 2 ? 'show' : 'movie';
-    const cacheKey = `${cacheService.matchKey(stashId, request.title, request.year)}:${kind}`;
+    const manual = request.manual === 1;
+    const cacheKey = `${cacheService.matchKey(stashId, request.title, request.year, manual)}:${kind}`;
     const cached = cacheService.getMatch(cacheKey) as MatchResponse | undefined;
     if (cached) return cached;
 
     const stash = await configService.getStash(stashId);
-    if (!stash) return { MediaContainer: { size: 0, SearchResult: [] } };
+    if (!stash) return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Metadata: [] } };
 
     try {
       const identifier = buildIdentifier(stashId);
       const scenes = await stashService.findScenes(stash, request.title, request.year);
-      const results = scenes
-        .map((s) => sceneToMatchResult(identifier, stashId, s, request.title, kind, request.year))
-        .sort((a, b) => b.score - a.score);
 
-      // Plex silently discards match results with score < 80.
+      const paired = scenes.map((scene) => ({
+        scene,
+        result: sceneToMatchResult(identifier, stashId, scene, request.title, kind, request.year),
+      }));
+      paired.sort((a, b) => b.result.score - a.result.score);
+
+      // Per Plex's official docs, scores over 85 are considered a positive
+      // match; anything at or below that may be treated as ambiguous/ignored.
       // Stash often finds scenes via hash/filename where the returned title
       // (e.g. Japanese) bears no textual similarity to the search string,
       // producing a titleScore of 0. Override scores so the top result is
-      // always 100 and subsequent results decrease by 1 (floor at 80).
-      results.forEach((r, i) => {
-        r.score = Math.max(100 - i, 80);
+      // always 100 and subsequent results decrease by 1 (floor at 86).
+      paired.forEach((p, i) => {
+        p.result.score = Math.max(100 - i, 86);
       });
+
+      // `includeFullMetadata` isn't part of Plex's documented match protocol,
+      // and in practice Plex does not reliably follow up a match with a GET
+      // /library/metadata/{id} call — the match response itself is often the
+      // only chance to deliver summary/genre/images. So the full item is
+      // always embedded for anything that clears the positive-match
+      // threshold (85), regardless of what the request asked for.
+      const fs = resolveFieldSync(stash.fieldSync);
+      for (const p of paired) {
+        if (p.result.score > 85) {
+          enrichMatchResultWithFullMetadata(p.result, stashId, p.scene, fs);
+        }
+      }
+
+      const results = paired.map((p) => p.result);
 
       loggerService.info(
         `Match "${request.title}" → ${results.length} results (${kind})`,
@@ -364,23 +375,25 @@ class ProviderService {
       );
 
       const response: MatchResponse = {
-        MediaContainer: { size: results.length, SearchResult: results },
+        MediaContainer: {
+          offset: 0,
+          totalSize: results.length,
+          identifier,
+          size: results.length,
+          Metadata: results,
+        },
       };
       cacheService.setMatch(cacheKey, response);
       return response;
     } catch (err: any) {
       loggerService.error(`match error: ${err.message}`, stashId);
-      return { MediaContainer: { size: 0, SearchResult: [] } };
+      return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Metadata: [] } };
     }
   }
 
-  /**
-   * Match with multi-provider fallback (priority order).
-   * Falls back to other enabled stashes if the primary returns nothing.
-   */
   async matchMetadataWithFallback(primaryStashId: string, request: MatchRequest): Promise<MatchResponse> {
     const primary = await this.matchMetadata(primaryStashId, request);
-    if (primary.MediaContainer.SearchResult.length > 0) return primary;
+    if (primary.MediaContainer.Metadata.length > 0) return primary;
 
     const allStashes = await configService.getStashes();
     const fallbacks = allStashes
@@ -390,7 +403,7 @@ class ProviderService {
     for (const stash of fallbacks) {
       try {
         const result = await this.matchMetadata(stash.id, request);
-        if (result.MediaContainer.SearchResult.length > 0) {
+        if (result.MediaContainer.Metadata.length > 0) {
           loggerService.info(
             `Fallback match "${request.title}" resolved via stash=${stash.id}`,
             primaryStashId,
@@ -400,28 +413,23 @@ class ProviderService {
       } catch { continue; }
     }
 
-    return { MediaContainer: { size: 0, SearchResult: [] } };
+    return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Metadata: [] } };
   }
 
-  /**
-   * Metadata — fetch a single item by its ratingKey.
-   * Parses the prefixed id (movie.*, show.*, season.*, episode.*).
-   * Applies fieldSync to filter optional metadata fields.
-   */
   async getMetadata(stashId: string, itemId: string): Promise<MetadataResponse> {
     const cacheKey = cacheService.metadataKey(stashId, itemId);
     const cached = cacheService.getMetadata(cacheKey) as MetadataResponse | undefined;
     if (cached) return cached;
 
     const stash = await configService.getStash(stashId);
-    if (!stash) return { MediaContainer: { size: 0, Metadata: [] } };
+    if (!stash) return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Metadata: [] } };
 
     const { kind, sceneId } = parseItemId(itemId);
     const fs = resolveFieldSync(stash.fieldSync);
 
     try {
       const scene = await stashService.findScene(stash, sceneId);
-      if (!scene) return { MediaContainer: { size: 0, Metadata: [] } };
+      if (!scene) return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Metadata: [] } };
 
       const identifier = buildIdentifier(stashId);
       let metadata: MetadataItem;
@@ -436,25 +444,19 @@ class ProviderService {
       loggerService.debug(`Metadata fetched: ${itemId} (${kind})`, stashId);
 
       const response: MetadataResponse = {
-        MediaContainer: { size: 1, Metadata: [metadata] },
+        MediaContainer: { offset: 0, totalSize: 1, identifier, size: 1, Metadata: [metadata] },
       };
       cacheService.setMetadata(cacheKey, response);
       return response;
     } catch (err: any) {
       loggerService.error(`metadata error id=${itemId}: ${err.message}`, stashId);
-      return { MediaContainer: { size: 0, Metadata: [] } };
+      return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Metadata: [] } };
     }
   }
 
-  /**
-   * Children — traverse the Show → Season → Episode hierarchy.
-   *   • show.*   → returns the virtual Season 1
-   *   • season.* → returns Episode 1 (the actual Stash scene)
-   *   • movie.* / episode.* → empty (leaves have no children)
-   */
   async getChildren(stashId: string, itemId: string): Promise<ChildrenResponse> {
     const emptyContainer = (key: string): ChildrenResponse => ({
-      MediaContainer: { size: 0, key, Metadata: [] },
+      MediaContainer: { offset: 0, totalSize: 0, size: 0, key, Metadata: [] },
     });
 
     const { kind, sceneId } = parseItemId(itemId);
@@ -477,6 +479,9 @@ class ProviderService {
         const season = sceneToSeasonMetadata(identifier, stashId, scene, fs);
         return {
           MediaContainer: {
+            offset: 0,
+            totalSize: 1,
+            identifier,
             size: 1,
             key,
             parentRatingKey: buildRatingKey('show', sceneId),
@@ -489,6 +494,9 @@ class ProviderService {
       const episode = sceneToEpisodeMetadata(identifier, stashId, scene, fs);
       return {
         MediaContainer: {
+          offset: 0,
+          totalSize: 1,
+          identifier,
           size: 1,
           key,
           parentRatingKey: buildRatingKey('season', sceneId),
@@ -502,13 +510,9 @@ class ProviderService {
     }
   }
 
-  /**
-   * Images — proxied image URLs for any item type.
-   * Respects fieldSync.poster and fieldSync.background.
-   */
   async getImages(stashId: string, itemId: string): Promise<ImagesResponse> {
     const stash = await configService.getStash(stashId);
-    if (!stash) return { MediaContainer: { size: 0, Metadata: [] } };
+    if (!stash) return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Image: [] } };
 
     const { sceneId } = parseItemId(itemId);
     const identifier = buildIdentifier(stashId);
@@ -516,10 +520,10 @@ class ProviderService {
 
     try {
       const scene = await stashService.findScene(stash, sceneId);
-      if (!scene) return { MediaContainer: { size: 0, Metadata: [] } };
+      if (!scene) return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Image: [] } };
 
       const rk = `${stashId}.${scene.id}`;
-      const images: ImagesResponse['MediaContainer']['Metadata'] = [];
+      const images: ImagesResponse['MediaContainer']['Image'] = [];
 
       if (fs.poster && scene.paths?.screenshot) {
         images.push({
@@ -550,9 +554,11 @@ class ProviderService {
         }
       }
 
-      return { MediaContainer: { size: images.length, Metadata: images } };
+      return {
+        MediaContainer: { offset: 0, totalSize: images.length, identifier, size: images.length, Image: images },
+      };
     } catch {
-      return { MediaContainer: { size: 0, Metadata: [] } };
+      return { MediaContainer: { offset: 0, totalSize: 0, size: 0, Image: [] } };
     }
   }
 }
