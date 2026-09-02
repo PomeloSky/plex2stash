@@ -14,6 +14,8 @@ export const MatchRequestSchema = z.object({
   title: z.string().min(1, 'title is required'),
   year:  z.coerce.number().int().optional(),
   type:  z.coerce.number().int().optional(),
+  includeFullMetadata: z.coerce.number().int().optional(),
+  manual: z.coerce.number().int().optional(),
 });
 
 export type MatchRequestInput = z.infer<typeof MatchRequestSchema>;
